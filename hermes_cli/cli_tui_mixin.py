@@ -850,6 +850,9 @@ class CLITuiMixin:
         from cli import _DIM, _RST, _cprint, logger
         if not self._voice_mode:
             return
+        # The physical-key worker owns start/stop when hold-to-talk is enabled.
+        if getattr(self, "_voice_hold_controller", None) is not None:
+            return
         if self._voice_recording:
             # Always allow STOPPING (even while the agent runs); manual stop ends continuous
             # mode. Flag clearing happens atomically inside _voice_stop_and_transcribe.
@@ -1899,6 +1902,7 @@ class CLITuiMixin:
         self._voice_recording = False
         self._voice_processing, self._voice_live_text = False, ""  # STT in progress; live partial text
         self._voice_continuous = False  # auto-restart after the agent responds
+        self._voice_hold_controller = None  # optional Win32 key-up listener
         self._voice_tts_done = threading.Event()  # TTS playback finished
         self._voice_tts_done.set()  # initially "done" (no TTS pending)
         self._voice_tts_stop = None  # active streaming pipeline's stop event
@@ -1961,6 +1965,15 @@ class CLITuiMixin:
         kb.add('c-z')(self._tui_handle_ctrl_z)
 
         kb.add(*self._tui_voice_record_key_sequence())(self._tui_handle_voice_record)
+        # Consume F8-F12 in the terminal when one is configured for physical hold.
+        # The Win32 poller handles both edges; prompt_toolkit only handles key-down.
+        from hermes_cli.voice_hold_to_talk import normalize_hold_key
+        _hold_key = normalize_hold_key(
+            (self.config.get("voice") or {}).get("hold_key")
+            if isinstance(self.config.get("voice"), dict) else None
+        )
+        if os.name == "nt" and _hold_key is not None:
+            kb.add(_hold_key)(lambda event: None)
         kb.add(Keys.BracketedPaste, eager=True)(self._tui_handle_paste)
         kb.add('c-v')(self._tui_handle_ctrl_v)
         kb.add('escape', 'v')(self._tui_handle_alt_v)

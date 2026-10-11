@@ -59,8 +59,8 @@ class CLIVoiceMixin:
         if hasattr(self, '_app') and self._app:
             self._app.invalidate()
 
-    def _voice_start_recording(self):
-        """Start capturing audio from the microphone."""
+    def _voice_start_recording(self, *, hold_to_talk: bool = False):
+        """Start microphone capture; physical hold mode disables silence auto-stop."""
         from cli import _ACCENT, _DIM, _RST, _cprint
         if getattr(self, '_should_exit', False):
             return
@@ -120,13 +120,15 @@ class CLIVoiceMixin:
         self._voice_beep(frequency=880, count=1)
 
         try:
-            self._voice_recorder.start(on_silence_stop=_on_silence)
+            self._voice_recorder.start(on_silence_stop=None if hold_to_talk else _on_silence)
         except Exception:
             with self._voice_lock:
                 self._voice_recording = False
             raise
         _label = self._voice_record_key_label()
-        if getattr(self._voice_recorder, "supports_silence_autostop", True):
+        if hold_to_talk:
+            _recording_hint = _label
+        elif getattr(self._voice_recorder, "supports_silence_autostop", True):
             _recording_hint = t("cli.voice.hint_continuous", shortcut=_label)
         elif _is_termux_environment():
             _recording_hint = t("cli.voice.hint_termux", shortcut=_label)
@@ -477,6 +479,52 @@ class CLIVoiceMixin:
         except Exception:
             return True
 
+    def _voice_start_hold_to_talk(self) -> None:
+        """Opt-in Windows-only physical F8-F12 press/release recording."""
+        from cli import _DIM, _RST, _cprint
+        from hermes_cli.voice_hold_to_talk import WindowsHoldToTalk, normalize_hold_key
+
+        raw = _config_section("voice").get("hold_key")
+        if raw is None:
+            return
+        key = normalize_hold_key(raw)
+        if key is None:
+            _cprint(f"{_DIM}voice.hold_key must be f8, f9, f10, f11 or f12.{_RST}")
+            return
+        if os.name != "nt":
+            _cprint(f"{_DIM}voice.hold_key currently requires Windows.{_RST}")
+            return
+
+        def _press() -> bool:
+            # Never steal the mic during an agent turn, STT, TTS, or modal prompt.
+            if (not self._voice_mode or self._voice_recording or self._voice_processing
+                    or self._agent_running or not self._voice_tts_done.is_set()
+                    or not self._pending_input.empty()
+                    or self._clarify_state or self._sudo_state or self._approval_state
+                    or self._slash_confirm_state or self._connection_state):
+                return False
+            with self._voice_lock:
+                self._voice_continuous = False
+            try:
+                self._voice_start_recording(hold_to_talk=True)
+                self._voice_invalidate()
+                return bool(self._voice_recording)
+            except Exception as exc:
+                _cprint(f"{_DIM}Hold-to-talk start failed: {exc}{_RST}")
+                return False
+
+        def _release() -> None:
+            self._voice_stop_and_transcribe()
+            self._voice_invalidate()
+
+        controller = WindowsHoldToTalk(
+            key, enabled=lambda: bool(self._voice_mode),
+            on_press=_press, on_release=_release,
+        )
+        self._voice_hold_controller = controller
+        self._voice_record_key_display_cache = key.upper() + " (hold)"
+        controller.start()
+
     def _enable_voice_mode(self):
         """Enable voice mode after checking requirements."""
         from cli import _ACCENT, _BOLD, _DIM, _RST, _cprint
@@ -508,6 +556,7 @@ class CLIVoiceMixin:
         if _config_section("voice").get("auto_tts", False):
             with self._voice_lock:
                 self._voice_tts = True
+        self._voice_start_hold_to_talk()
 
         # The voice-mode instruction is injected as a user message prefix (not a system
         # prompt change) to avoid invalidating the prompt cache — see _voice_message_prefix.
@@ -558,6 +607,11 @@ class CLIVoiceMixin:
     def _disable_voice_mode(self):
         """Disable voice mode, cancel any active recording, and stop TTS."""
         from cli import _DIM, _RST, _cprint, logger
+        controller = getattr(self, "_voice_hold_controller", None)
+        self._voice_hold_controller = None
+        if controller is not None:
+            controller.stop()
+            self.set_voice_record_key_cache(_config_section("voice").get("record_key"))
         with self._voice_lock:
             if self._voice_recording and self._voice_recorder:
                 self._voice_recorder.cancel()
